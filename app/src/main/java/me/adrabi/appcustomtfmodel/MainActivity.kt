@@ -1,34 +1,31 @@
 package me.adrabi.appcustomtfmodel
 
+import android.app.DownloadManager
+import android.content.Context
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.*
 import androidx.compose.material.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.tooling.preview.Preview
-import com.google.firebase.ml.modeldownloader.CustomModel
-import com.google.firebase.ml.modeldownloader.CustomModelDownloadConditions
-import com.google.firebase.ml.modeldownloader.DownloadType
-import com.google.firebase.ml.modeldownloader.FirebaseModelDownloader
-import kotlinx.coroutines.async
-import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.first
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
+import me.adrabi.appcustomtfmodel.database.entities.CustomModelEntity
+import me.adrabi.appcustomtfmodel.models.DownloadingStatus
 import me.adrabi.appcustomtfmodel.ui.theme.AppCustomModelTheme
 import org.tensorflow.lite.Interpreter
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 
 // The model metadata will be downloaded from Firebase Database
-object Model{
-    const val name = "PandApp-T2"
+object Model {
+    const val name = "PandApp-T4"
     const val inputSize = 7
     const val outputSize = 5
     const val accepted = 0
@@ -85,7 +82,6 @@ object Model{
 }
 
 
-
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -108,90 +104,165 @@ class MainActivity : ComponentActivity() {
 fun ChatZone() {
     var question by remember { mutableStateOf("") }
     var response by remember { mutableStateOf("") }
+    var progress by remember {
+        mutableStateOf(0f)
+    }
+    val coroutineScope = rememberCoroutineScope()
+
+
+    val context: Context = LocalContext.current
 
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
+        Button(onClick = {
+            download(context) {
+                progress = it.progress
+            }
+        }) {
+            Text("Download the model")
+        }
+        Divider(modifier = Modifier.padding(5.dp))
         TextField(value = question,
             onValueChange = { question = it },
             modifier = Modifier.fillMaxWidth(),
             placeholder = { Text("Type the question") })
-        Button(onClick = { predict(question){ response = it } }) {
+        Button(onClick = {
+            coroutineScope.launch {
+                val service = CustomModelService.build(context)
+                val customModel = service.get(Model.name)
+                response = predict(customModel.path, question)
+            }
+        }
+        ) {
             Text(text = "Predicate")
         }
         Divider()
         Text(text = response)
+        Divider(Modifier.padding(vertical = 15.dp))
+        LinearProgressIndicator(progress = progress)
+        Divider(Modifier.padding(vertical = 15.dp))
+        Button(onClick = {
+            coroutineScope.launch {
+                val service = CustomModelService.build(context)
+                Log.i("<Local Database>", service.getAll().toString())
+            }
+        }) {
+            Text("Show all")
+        }
+        Button(onClick = {
+            coroutineScope.launch {
+                val service = CustomModelService.build(context)
+                service.insertAll(
+                    CustomModelEntity(
+                        "Model-2",
+                        "/to/path || ${Math.random()}"
+                    )
+                )
+                Log.i("<Local Database>", service.getAll().toString())
+            }
+        }) {
+            Text("Insert")
+        }
     }
 }
 
-fun predict(question: String, callback: (String) -> Unit){
+
+fun download(context: Context, update: (DownloadingStatus) -> Unit) {
+
+    val dl = DownloadModelService.build(context)
+    dl.getModel(Model.name) {
+
+        update(DownloadingStatus(it.status, it.downloaded / it.total.toFloat()))
+
+        when (it.status) {
+            DownloadManager.STATUS_FAILED -> {
+                Log.i("<DownloadButton>", "STATUS_FAILED")
+                return@getModel false
+            }
+            DownloadManager.STATUS_SUCCESSFUL -> {
+                Log.i("<DownloadButton>", "STATUS_SUCCESSFUL")
+                return@getModel false
+            }
+            DownloadManager.STATUS_PENDING -> {
+                Log.i("<DownloadButton>", "STATUS_PENDING")
+                return@getModel true
+            }
+            DownloadManager.STATUS_PAUSED -> {
+                Log.i("<DownloadButton>", "STATUS_PAUSED")
+                return@getModel true
+            }
+            DownloadManager.STATUS_RUNNING -> {
+                Log.i("<DownloadButton>", "STATUS_RUNNING")
+                return@getModel true
+            }
+        }
+
+        false
+    }
+}
+
+
+fun predict(path: String, question: String): String {
+
     // We do basic some text
     val question: String = question
         .lowercase()
-        .replace("""[\p{P}\p{S}&&[^.]]+""".toRegex(), "")
+        .replace("""[\p{P}\p{S}]+""".toRegex(), " ")
 
+    Log.i("<The question>", question)
     // Encoding
-    var encoded = mutableListOf<Int>()
-    for(s in question.split(" ")){
+    val encoded = mutableListOf<Int>()
+    for (s in question.split(" ")) {
         Model.vocabulary[s]?.let { encoded.add(it) }
     }
 
     // Padding
-    for(i in 0 until Model.inputSize - encoded.size){
+    for (i in 0 until Model.inputSize - encoded.size) {
         encoded.add(0, 0)
     }
 
     Log.i("<Encoding>", encoded.toString())
+    //
+    val interpreter = Interpreter(File(path))
+    val inputBufferSize = Model.inputSize * java.lang.Float.SIZE / java.lang.Byte.SIZE
+    val modelInput =
+        ByteBuffer.allocateDirect(inputBufferSize).order(ByteOrder.nativeOrder())
 
-    val conditions = CustomModelDownloadConditions.Builder()
-        .requireWifi()  // Also possible: .requireCharging() and .requireDeviceIdle()
-        .build()
-    FirebaseModelDownloader.getInstance()
-        .getModel(
-            Model.name, DownloadType.LOCAL_MODEL_UPDATE_IN_BACKGROUND,
-            conditions
-        )
-        .addOnSuccessListener { model: CustomModel? ->
-            // The CustomModel object contains the local path of the model file,
-            // which you can use to instantiate a TensorFlow Lite interpreter.
-            val modelFile = model?.file
-            if (modelFile != null) {
-                val interpreter = Interpreter(modelFile)
+    // Set message to buffer
+    for (c in encoded) {
+        modelInput.putFloat(c.toFloat())
+    }
 
-                val inputBufferSize = Model.inputSize * java.lang.Float.SIZE / java.lang.Byte.SIZE
-                val modelInput =
-                    ByteBuffer.allocateDirect(inputBufferSize).order(ByteOrder.nativeOrder())
+    val outputBufferSize = Model.outputSize * java.lang.Float.SIZE / java.lang.Byte.SIZE
+    val modelOutput =
+        ByteBuffer.allocateDirect(outputBufferSize).order(ByteOrder.nativeOrder())
 
-                // Set message to buffer
-                for(c in encoded){
-                    modelInput.putInt(c)
-                }
+    interpreter.run(modelInput, modelOutput)
 
-                val outputBufferSize = Model.outputSize * java.lang.Float.SIZE / java.lang.Byte.SIZE
-                val modelOutput =
-                    ByteBuffer.allocateDirect(outputBufferSize).order(ByteOrder.nativeOrder())
+    interpreter.close()
 
-                interpreter.run(modelInput, modelOutput)
-                modelOutput.rewind()
-                val buff = modelOutput.asFloatBuffer()
-                val probabilities = mutableListOf<Float>()
-                for(i in 0 until buff.capacity()){
-                    probabilities.add(buff[i])
-                }
-                val argmax = probabilities
-                    .withIndex()
-                    .filter { it.value >= Model.accepted }
-                    .maxByOrNull { it.value }?.index ?: -1
-                Log.i("<Prediction>", probabilities.toString())
-                Log.i("<Prediction>", argmax.toString())
-                if (argmax > - 1){
-                    callback(Model.responses[Model.uuid[argmax]]!!)
-                }
-                else{
-                    callback("I Cannot understand your question!")
-                }
-            }
-        }
+    modelOutput.rewind()
+    val buff = modelOutput.asFloatBuffer()
+    val probabilities = mutableListOf<Float>()
+    for (i in 0 until buff.capacity()) {
+        probabilities.add(buff[i])
+    }
+    Log.i("<Probabilities>", probabilities.toString())
+    val argmax = probabilities
+        .withIndex()
+        .filter { it.value >= Model.accepted }
+        .maxByOrNull { it.value }?.index ?: -1
+
+    return if (argmax >= 0)
+        Model.responses[Model.uuid[argmax]]!!
+    else
+        "<--- Nothing --->"
 }
+
+/*
+
+
+ */
